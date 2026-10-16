@@ -1,0 +1,8 @@
+{
+  "id": "link-tabs",
+  "name": "Link Tabs",
+  "description": "Keeps every link an agent shares a tap away in a Links pill above the composer, grouped by where it points, with the ones you pin in the bar",
+  "requirements": {
+    "paseo": ">=0.11.2"
+  }
+}
