@@ -1,22 +1,20 @@
-import {
-  openExternalUrl,
-  useRpc,
-  useSettings,
-  type PluginButtonContentProps,
-} from "@getpaseo/plugin/client";
+import { useRpc, useSettings, type PluginButtonContentProps } from "@getpaseo/plugin/client";
 import { copyText, Icon, TextInput, useToast } from "@getpaseo/plugin/client/react-native";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
+  Animated,
+  Platform,
   Pressable,
   Text,
   View,
   type AccessibilityActionEvent,
   type PressableProps,
   type StyleProp,
+  type TextStyle,
   type ViewStyle,
 } from "react-native";
-import { arrange, GROUP_ICONS, isCleared } from "../shared/groups";
+import { arrange, fadeOf, GROUP_ICONS, isCleared, labelOf } from "../shared/groups";
 import {
   linkSettings,
   listLinks,
@@ -36,9 +34,12 @@ import {
   pinLink,
   pinGroup,
 } from "./edits";
+import { fadeTextTail, holdEscape, fadeToBackground } from "./web";
 
 type Props = PluginButtonContentProps & {
   onLinks(agentId: string, groups: readonly ArrangedGroup[]): void;
+  /** Opens a link the way a tap should: in Paseo's browser, through the Link preview panel. */
+  onOpen(link: Link): void;
   /** Called after the user changes how links are organized. */
   onChange(): void;
 };
@@ -59,14 +60,199 @@ type Drop = { group: string; index: number; y: number } | { index: number; y: nu
 /** A link shown whole, wrapping after its separators rather than mid-word. */
 const breakable = (url: string) => url.replace(/([/?&=#])/g, "$1​");
 
-const GROUP_GAP = 20;
-
-/** The height of one item in a ⋮ menu, to place the menu before it renders. */
-const MENU_ITEM = 34;
+/** What a row shows, copies, and names: a local file's path, else the link itself. */
+const targetOf = (link: Link) => link.path ?? link.url;
 
 /**
- * One of a row's actions: a button on the row, or with `inMenu` an item in its ⋮ menu. `on`
- * marks a pin that is set; `off` dims a button that can't act.
+ * A field laid exactly over the text it edits: the text stays where it was, hidden, so the row
+ * keeps its size and nothing moves when editing starts or stops.
+ */
+function InlineEdit({
+  value,
+  onChange,
+  onCommit,
+  onCancel,
+  placeholder,
+  color,
+  font,
+}: {
+  value: string;
+  onChange(text: string): void;
+  onCommit(text: string): void;
+  onCancel(): void;
+  placeholder: string;
+  color: string;
+  font: StyleProp<TextStyle>;
+}) {
+  const finished = useRef(false);
+  const finish = (commit: boolean) => {
+    if (finished.current) return;
+    finished.current = true;
+    if (commit) onCommit(value);
+    else onCancel();
+  };
+  useEffect(() => holdEscape(() => finish(false)), []);
+
+  return (
+    <TextInput
+      autoFocus
+      selectTextOnFocus
+      value={value}
+      onChangeText={onChange}
+      onSubmitEditing={() => finish(true)}
+      onBlur={() => finish(true)}
+      placeholder={placeholder}
+      placeholderTextColor={color}
+      style={[inlineEditStyles.field, font, { color }]}
+    />
+  );
+}
+
+const inlineEditStyles = {
+  field: {
+    position: "absolute" as const,
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    padding: 0,
+    margin: 0,
+    borderWidth: 0,
+    backgroundColor: "transparent" as const,
+    outlineWidth: 0,
+    textAlignVertical: "center" as const,
+  },
+};
+
+/**
+ * A group's links, opening and closing in place. Its height is measured from the rows themselves,
+ * so a group with two lines and a group with twenty both animate to their own size.
+ */
+function GroupBody({ collapsed, children }: { collapsed: boolean; children: ReactNode }) {
+  const progress = useRef(new Animated.Value(collapsed ? 0 : 1)).current;
+  const [height, setHeight] = useState(0);
+  useEffect(() => {
+    Animated.timing(progress, {
+      toValue: collapsed ? 0 : 1,
+      duration: 150,
+      useNativeDriver: false,
+    }).start();
+  }, [collapsed, progress]);
+  return (
+    <Animated.View
+      style={{
+        overflow: "hidden",
+        height: height ? progress.interpolate({ inputRange: [0, 1], outputRange: [0, height] }) : undefined,
+      }}
+      pointerEvents={collapsed ? "none" : "auto"}
+    >
+      <View onLayout={({ nativeEvent }) => setHeight(nativeEvent.layout.height)}>{children}</View>
+    </Animated.View>
+  );
+}
+
+/** A drawn checkbox: a square outline, filled in only by its tick. No icon glyph, no accent. */
+function Checkbox({
+  checked,
+  color,
+  edge,
+}: {
+  checked: boolean;
+  color: string;
+  edge: string;
+}) {
+  return (
+    <View style={[checkboxStyles.box, { borderColor: checked ? color : edge }]}>
+      {checked ? <View style={[checkboxStyles.tick, { borderColor: color }]} /> : null}
+    </View>
+  );
+}
+
+const checkboxStyles = {
+  box: {
+    width: 16,
+    height: 16,
+    borderRadius: 4,
+    borderWidth: 1.5,
+    alignItems: "center" as const,
+    justifyContent: "center" as const,
+  },
+  // Two edges of a small box, turned, make the tick.
+  tick: {
+    width: 5,
+    height: 9,
+    borderRightWidth: 1.5,
+    borderBottomWidth: 1.5,
+    transform: [{ rotate: "45deg" }],
+    marginTop: -2,
+  },
+};
+
+/**
+ * The part of a row the buttons sit over. On the web its tail fades out while they are showing,
+ * so the row gives its whole width to the link when nothing is hovering it.
+ */
+function FadeTail({
+  active,
+  fade = ACTION_FADE,
+  clear = ACTION_CLEAR,
+  style,
+  children,
+}: {
+  active: boolean;
+  /** Where the fade begins and where the text is gone, from the right edge. */
+  fade?: number;
+  clear?: number;
+  style?: StyleProp<ViewStyle>;
+  children: ReactNode;
+}) {
+  const node = useRef<View>(null);
+  useEffect(() => {
+    fadeTextTail(node.current, active ? fade : 0, clear);
+  }, [active, fade, clear]);
+  return (
+    <View ref={node} style={style}>
+      {children}
+    </View>
+  );
+}
+
+/**
+ * The footer, stuck to the bottom of whatever scrolls the list, over a fade into the surface, so
+ * rows melt away behind its buttons. Only the web can stick; elsewhere it follows the list.
+ */
+function StickyFooter({ surface, children }: { surface: string; children: ReactNode }) {
+  const blur = useRef<View>(null);
+  // The surface colour is a dependency so a theme change paints the fade again.
+  useEffect(() => fadeToBackground(blur.current), [surface]);
+  return (
+    <View style={stickyStyles.footer}>
+      <View ref={blur} pointerEvents="none" style={stickyStyles.blur} />
+      {children}
+    </View>
+  );
+}
+
+const stickyStyles = {
+  // `sticky` is web-only CSS that React Native's styles do not list. `bottom: 4` is where the
+  // footer naturally ends (4 above the scroller edge), so it does not shift when the list scrolls
+  // to its end; the fade reaches 4 further down to cover the strip left under it.
+  footer: { position: "sticky", bottom: 4, zIndex: 1 } as unknown as ViewStyle,
+  blur: { position: "absolute" as const, top: -14, left: -12, right: -12, bottom: -4 },
+};
+
+const GROUP_GAP = 16;
+
+/** Where the fade under the hovering buttons starts, and where the text is gone, from the right. */
+const ACTION_FADE = 124;
+const ACTION_CLEAR = 84;
+/** A pinned row shows only its pin, so only that much of the text gives way. */
+const PIN_FADE = 44;
+const PIN_CLEAR = 28;
+
+/**
+ * One of a row's actions: a button on the row. `on` marks a pin that is set; `off` dims a button
+ * that can't act.
  */
 type Action = {
   icon: string;
@@ -74,8 +260,6 @@ type Action = {
   run(): void;
   on?: boolean;
   off?: boolean;
-  inMenu?: boolean;
-  danger?: boolean;
 };
 
 type Interaction = { pressed: boolean; hovered: boolean };
@@ -112,11 +296,15 @@ function AgentLinks({
   layout,
   close,
   onLinks,
+  onOpen,
   onChange,
 }: Props & { agentId: string }) {
   const list = useRpc(listLinks);
   // Read again every time the list opens, which also catches links written mid-turn.
-  const query = useQuery({ queryKey: ["links", agentId], queryFn: () => list({ agentId }) });
+  const query = useQuery({ queryKey: ["links", agentId], queryFn: () => list({ agentId }),
+    // Titles are fetched in the background; ask again until they are all in.
+    refetchInterval: (current) => (current.state.data?.titlesPending ? 2500 : false),
+  });
   const settings = useSettings(linkSettings);
   const toast = useToast();
   // A change shows at once and stays until it is saved, or reverts if saving fails.
@@ -128,18 +316,36 @@ function AgentLinks({
   /** The link row under the pointer, by row key. */
   const [hovered, setHovered] = useState<string | null>(null);
   /**
-   * Rearranging, from Rearrange in any ⋮ menu: every row drags, and nothing else responds to a
-   * press, so a drag never has to compete with opening a link or scrolling the list.
+   * Rearranging, from the button beside New group: every row drags, and nothing else responds to
+   * a press, so a drag never has to compete with opening a link or scrolling the list.
    */
   const [rearranging, setRearranging] = useState(false);
-  /** The row whose ⋮ menu is open, and where the menu sits. */
-  const [menu, setMenu] = useState<{ key: string; top: number; bottom: number } | null>(null);
-  /** The list's height, to open a menu upward when it would run past the end. */
-  const [height, setHeight] = useState(0);
+  /**
+   * Deleting: rows pick links instead of opening them, across every group, and the footer asks
+   * twice before anything goes.
+   */
+  const [deleting, setDeleting] = useState(false);
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  /**
+   * Groups the user flipped from how they start, by group ID. A group starts open, or closed when
+   * all its links are archived.
+   */
+  const [flipped, setCollapsed] = useState<ReadonlySet<string>>(new Set());
+  /** Groups whose Archive row is open, by group ID. */
+  const [archiveOpen, setArchiveOpen] = useState<ReadonlySet<string>>(new Set());
+  /** The row whose copy button just fired, so its icon can acknowledge it. */
+  const [copiedRow, setCopiedRow] = useState<string | null>(null);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** The row being renamed, by row key, and the name being typed. */
   const [renaming, setRenaming] = useState<string | null>(null);
   const [name, setName] = useState("");
   const container = useRef<View>(null);
+  useEffect(
+    () => () => {
+      if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
   /** Every row's view, and where each was when the current drag started. */
   const nodes = useRef(new Map<string, View>());
   const rows = useRef(new Map<string, { y: number; height: number }>());
@@ -163,16 +369,24 @@ function AgentLinks({
   const muted = theme.colors.foregroundMuted;
   const styles = useMemo(
     () => ({
-      // Paseo's popover is 280 to 420 wide; the list fills it as its links need, and long URLs wrap.
-      list: { paddingBottom: 4 },
-      // Buttons line up on the right of every row, with room to the edge.
+      // The popover's own box: the menu and its backdrop are placed against this one, so they line
+      // up with the popover rather than with the rows.
+      list: {},
+      // Paseo wraps plugin popover content in 12 of padding and a gap, and its own panel rows have
+      // neither, so the rows take that padding back to sit on the same rails as the sub-agents.
+      // Paseo's own panel rows are flush to the panel at the top and bottom and inset 4 at the
+      // sides, so that is what this is too.
+      rails: { marginHorizontal: -12, marginTop: -12, marginBottom: -12 },
+      // Paseo's own panel rows: 32 tall, inset 4 from the panel edge, 8 in and 4 down inside.
       header: {
         flexDirection: "row" as const,
         alignItems: "center" as const,
-        gap: 6,
-        paddingLeft: 8,
-        paddingRight: 8,
-        borderRadius: 6,
+        gap: 8,
+        minHeight: 32,
+        marginHorizontal: 4,
+        paddingHorizontal: 8,
+        paddingVertical: 4,
+        borderRadius: 8,
       },
       rearrangeBar: {
         flexDirection: "row" as const,
@@ -208,13 +422,43 @@ function AgentLinks({
         textTransform: "uppercase" as const,
         letterSpacing: 0.5,
       },
+      // The page title under a link, quieter than the link itself.
+      pageTitle: {
+        color: theme.colors.foregroundMuted,
+        fontSize: 11,
+        userSelect: "none" as const,
+      },
       count: { color: theme.colors.foregroundMuted, fontSize: 11, userSelect: "none" as const },
-      spacer: { flexGrow: 1, minWidth: 16 },
+      // The row's own content, which gives way to the buttons floating over its tail.
+      headerTail: {
+        flexDirection: "row" as const,
+        alignItems: "center" as const,
+        gap: 8,
+        flexGrow: 1,
+        flexShrink: 1,
+        minWidth: 0,
+      },
+      linkTail: { flexGrow: 1, flexShrink: 1, minWidth: 0 },
+      // The whole header is the target that opens and closes the group, its padding included.
+      headerPress: {
+        flexGrow: 1,
+        flexShrink: 1,
+        minWidth: 0,
+        flexDirection: "row" as const,
+        alignItems: "center" as const,
+        gap: 8,
+        marginHorizontal: -8,
+        marginVertical: -4,
+        paddingHorizontal: 8,
+        paddingVertical: 4,
+      },
       row: {
         flexDirection: "row" as const,
         alignItems: "center" as const,
-        paddingRight: 8,
-        borderRadius: 6,
+        minHeight: 32,
+        marginHorizontal: 4,
+        paddingRight: 4,
+        borderRadius: 8,
       },
       link: {
         flexGrow: 1,
@@ -224,6 +468,14 @@ function AgentLinks({
         borderRadius: 6,
       },
       hover: { backgroundColor: tint(theme.colors.foreground, 0.07, theme.colors.surface2) },
+      archivePress: {
+        flexGrow: 1,
+        flexDirection: "row" as const,
+        alignItems: "center" as const,
+        gap: 8,
+        paddingVertical: 6,
+        paddingHorizontal: 8,
+      },
       press: { backgroundColor: tint(theme.colors.foreground, 0.13, theme.colors.surface2) },
       lifted: { backgroundColor: theme.colors.surface2, borderRadius: 6, zIndex: 1 },
       name: {
@@ -234,37 +486,45 @@ function AgentLinks({
       },
       url: { color: theme.colors.foreground, fontSize: 13, userSelect: "none" as const },
       secondary: { color: theme.colors.foregroundMuted, fontSize: 12 },
-      action: { padding: 7, borderRadius: 6 },
+      action: { padding: 5, borderRadius: 6 },
       actions: {
         flexDirection: "row" as const,
         alignItems: "center" as const,
-        gap: 2,
-        marginLeft: 8,
+        gap: 4,
+        marginLeft: 4,
       },
-      dim: { opacity: 0.35 },
-      backdrop: { position: "absolute" as const, top: 0, left: 0, right: 0, bottom: 0 },
-      menu: {
+      // Floating over the row's tail, so nothing is reserved for it while it is hidden.
+      actionsOverlay: {
         position: "absolute" as const,
-        right: 2,
-        minWidth: 168,
-        paddingVertical: 4,
-        borderRadius: 8,
-        borderWidth: 1,
-        borderColor: theme.colors.border,
-        // A step lighter than the list, so the menu reads as raised above it.
-        backgroundColor: theme.colors.surface2,
-        zIndex: 10,
+        top: 0,
+        bottom: 0,
+        right: 4,
+        justifyContent: "center" as const,
+        // Above the row's own pressable, which spans the whole row.
+        zIndex: 2,
       },
-      item: {
-        flexDirection: "row" as const,
-        alignItems: "center" as const,
-        gap: 8,
-        height: MENU_ITEM,
-        paddingHorizontal: 10,
-        marginHorizontal: 4,
-        borderRadius: 6,
+      // The other buttons sit to the left of a pin that is always there.
+      actionsBeforePin: { right: 32 },
+      // Faded out rather than unmounted, so revealing the buttons never resizes the row.
+      actionsHidden: { opacity: 0 },
+      dim: { opacity: 0.35 },
+      // A link row's content: a leading slot that holds the pick box or the drag handle, then its
+      // name and link. The slot is always there, empty, so neither mode moves anything.
+      linkBody: { flexDirection: "row" as const, alignItems: "center" as const, gap: 8 },
+      linkColumn: { flexShrink: 1 },
+      // A text and its field share one box, so editing never changes the row's size.
+      editWrap: { position: "relative" as const, flexShrink: 1 },
+      invisible: { opacity: 0 },
+      lead: { width: 16, alignItems: "center" as const, justifyContent: "center" as const },
+      // What the leading slot holds when no mode is on: a bullet, so the indent reads as a row
+      // marker rather than a gap.
+      bullet: {
+        width: 4,
+        height: 4,
+        borderRadius: 2,
+        backgroundColor: theme.colors.foregroundMuted,
+        opacity: 0.5,
       },
-      itemText: { fontSize: 13, userSelect: "none" as const },
       rename: {
         flexDirection: "row" as const,
         alignItems: "center" as const,
@@ -275,21 +535,36 @@ function AgentLinks({
       },
       drop: {
         position: "absolute" as const,
-        left: 0,
-        right: 0,
+        // The rows sit in the popover's padding, and this line marks them.
+        left: -12,
+        right: -12,
         height: 2,
         borderRadius: 1,
         backgroundColor: theme.colors.accent,
       },
       note: { color: theme.colors.foregroundMuted, padding: 8 },
+      // New group on the left, Rearrange on the right edge, on the same rail as the rows.
+      footer: {
+        flexDirection: "row" as const,
+        alignItems: "center" as const,
+        marginTop: 10,
+        marginHorizontal: 4,
+      },
+      // The button and the view that tracks the pointer both hug the label, so the hover only
+      // happens over the button and never over the empty row beside it.
+      // Aligned to the row edge, so the plus sits in the same column as the bullets.
+      addRow: { alignSelf: "flex-start" as const },
+      spacer: { flexGrow: 1 },
+      // Lines the button up with the ⋮ column of the rows above it.
+      footerAction: { marginRight: 4 },
       add: {
         flexDirection: "row" as const,
         alignItems: "center" as const,
-        gap: 6,
-        marginTop: GROUP_GAP,
-        paddingVertical: 6,
+        alignSelf: "flex-start" as const,
+        gap: 8,
+        minHeight: 32,
         paddingHorizontal: 8,
-        borderRadius: 6,
+        borderRadius: 8,
       },
       addText: { color: theme.colors.foregroundMuted, fontSize: 13, userSelect: "none" as const },
       form: { marginTop: GROUP_GAP, gap: 8 },
@@ -329,13 +604,51 @@ function AgentLinks({
 
   async function copy(links: readonly Link[]) {
     try {
-      await copyText(links.map(({ url }) => url).join("\n"));
+      await copyText(links.map(targetOf).join("\n"));
       toast.show(links.length === 1 ? "Link copied" : `${links.length} links copied`, {
         variant: "success",
       });
     } catch {
       toast.error("Could not copy.");
     }
+  }
+
+  function stopDeleting() {
+    setDeleting(false);
+    setSelected(new Set());
+  }
+
+  /** Deletes every picked link, wherever it sits, and leaves the pick mode. */
+  function deleteSelected() {
+    const links = view.flatMap((group) => group.links).filter((link) => selected.has(link.url));
+    if (!links.length) return;
+    stopDeleting();
+    toast.show(links.length === 1 ? "Link deleted" : `${links.length} links deleted`, {
+      variant: "success",
+    });
+    void save((current) => deleteLinks(current, agentId, links));
+  }
+
+  function pick(link: Link) {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(link.url)) next.delete(link.url);
+      else next.add(link.url);
+      return next;
+    });
+  }
+
+  /** Picks every link in a group, or none of them when all are already picked. */
+  function pickGroup(group: ArrangedGroup) {
+    setSelected((current) => {
+      const next = new Set(current);
+      const all = group.links.every((link) => next.has(link.url));
+      for (const link of group.links) {
+        if (all) next.delete(link.url);
+        else next.add(link.url);
+      }
+      return next;
+    });
   }
 
   function submitGroup() {
@@ -474,6 +787,13 @@ function AgentLinks({
 
   const busy = settings.status !== "ready" || settings.saving;
   const strong = theme.colors.foreground;
+  const hasLinks = view.some((group) => group.links.length > 0);
+  /**
+   * Where hovering is possible, the buttons float over the row's tail instead of holding a column
+   * of their own, so a link gets the whole width until you point at it. The touch clients have no
+   * hover, so there the buttons stay in the row and are always shown.
+   */
+  const overlayActions = !layout.compact && layout.platform === "web";
 
   function iconButton(icon: string, label: string, onPress: () => void, color = muted) {
     return (
@@ -488,78 +808,55 @@ function AgentLinks({
     );
   }
 
-  /** A row's actions: pin to the bar and copy on the row; rename and delete in its ⋮ menu. */
+  /** Whether a row shows its buttons: always where nothing can hover, else on hover or on demand. */
+  function revealedFor(key: string) {
+    return (
+      !deleting &&
+      (!overlayActions || hovered === key || renaming === key || rearranging)
+    );
+  }
+
+  /** A row's actions, all of them buttons on the row: pin, copy, open, and rename. */
   function actionsFor(key: string): Action[] {
     for (const group of view) {
       const name = group.title.toLowerCase();
       if (key === `g:${group.id}`) {
         return [
           {
+            icon: "Pencil",
+            label: "Rename",
+            run: () => startRename(key, group.title),
+          },
+          {
             icon: "Pin",
             label: group.pinned ? `Unpin ${name} from the bar` : `Pin ${name} to the bar`,
             on: group.pinned,
             run: () => void save((current) => pinGroup(current, group.id)),
           },
-          {
-            icon: "Copy",
-            label: `Copy all ${name} links`,
-            off: !group.links.length,
-            run: () => void copy(group.links),
-          },
-          {
-            icon: "ArrowUpDown",
-            label: "Rearrange",
-            inMenu: true,
-            run: () => setRearranging(true),
-          },
-          {
-            icon: "Pencil",
-            label: "Rename",
-            inMenu: true,
-            run: () => startRename(key, group.title),
-          },
-          {
-            icon: "Trash2",
-            label: group.links.length ? "Delete links" : "Delete group",
-            inMenu: true,
-            danger: true,
-            run: () =>
-              void save((current) =>
-                group.links.length
-                  ? deleteLinks(current, agentId, group.links)
-                  : removeGroup(current, group.id),
-              ),
-          },
         ];
       }
       const link = group.links.find((candidate) => key === `l:${candidate.url}`);
       if (link) {
+        const target = targetOf(link);
         return [
-          {
-            icon: "Pin",
-            label: link.pinned ? `Unpin ${link.url} from the bar` : `Pin ${link.url} to the bar`,
-            on: link.pinned,
-            run: () => void save((current) => pinLink(current, link.url)),
-          },
-          { icon: "Copy", label: `Copy ${link.url}`, run: () => void copy([link]) },
-          {
-            icon: "ArrowUpDown",
-            label: "Rearrange",
-            inMenu: true,
-            run: () => setRearranging(true),
-          },
           {
             icon: "Pencil",
             label: "Rename",
-            inMenu: true,
-            run: () => startRename(key, link.name ?? ""),
+            run: () => startRename(key, link.name ?? targetOf(link)),
           },
           {
-            icon: "Trash2",
-            label: "Delete",
-            inMenu: true,
-            danger: true,
-            run: () => void save((current) => deleteLinks(current, agentId, [link])),
+            icon: "Copy",
+            label: `Copy ${target}`,
+            run: () => {
+              void copy([link]);
+              flashCopied(key);
+            },
+          },
+          {
+            icon: "Pin",
+            label: link.pinned ? `Unpin ${target} from the bar` : `Pin ${target} to the bar`,
+            on: link.pinned,
+            run: () => void save((current) => pinLink(current, link.url)),
           },
         ];
       }
@@ -567,23 +864,29 @@ function AgentLinks({
     return [];
   }
 
-  /** A row's buttons, in the same columns on every row: pin, copy, and its ⋮ menu. */
+  /** A row's buttons, in the same columns on every row. */
   function actions(key: string, label: string) {
-    // While rearranging, the buttons give way to a grip: the whole row drags.
-    if (rearranging) {
-      return (
-        <View style={styles.actions}>
-          <View style={styles.action}>
-            <Icon name="GripVertical" size={16} color={muted} />
-          </View>
-        </View>
-      );
-    }
-    return (
-      <View style={styles.actions}>
-        {actionsFor(key)
-          .filter((action) => !action.inMenu)
-          .map(({ icon, label, run, on, off }) => (
+    // While rearranging the handle sits in the row's leading slot, so nothing is drawn here.
+    if (rearranging) return null;
+    // A row that is being renamed keeps its field to itself.
+    if (renaming === key || deleting) return null;
+    const list = actionsFor(key);
+    const pin = list.find((action) => action.icon === "Pin");
+    const rest = list.filter((action) => action !== pin);
+    const pinned = Boolean(pin?.on);
+    const revealed = revealedFor(key);
+    const cluster = (actions: Action[], shown: boolean, right: number) => (
+      <View
+        style={[
+          styles.actions,
+          overlayActions && [styles.actionsOverlay, { right }],
+          shown ? null : styles.actionsHidden,
+        ]}
+        pointerEvents={shown ? "auto" : "none"}
+      >
+        {actions.map(({ icon, label, run, on, off }) => {
+          const copied = icon === "Copy" && copiedRow === key;
+          return (
             <HoverPressable
               key={label}
               accessibilityRole="button"
@@ -593,73 +896,60 @@ function AgentLinks({
               style={feedback([styles.action, off && styles.dim])}
               onPress={run}
             >
-              <Icon name={icon} size={16} color={on ? theme.colors.accent : muted} />
+              <Icon
+                name={copied ? "Check" : icon}
+                size={14}
+                color={on || copied ? strong : muted}
+              />
             </HoverPressable>
-          ))}
-        <HoverPressable
-          accessibilityRole="button"
-          accessibilityLabel={`More for ${label}`}
-          accessibilityState={{ expanded: menu?.key === key }}
-          style={feedback(styles.action, menu?.key === key)}
-          onPress={() => {
-            setRenaming(null);
-            if (menu?.key === key) setMenu(null);
-            else openMenu(key);
-          }}
-        >
-          <Icon name="EllipsisVertical" size={16} color={menu?.key === key ? strong : muted} />
-        </HoverPressable>
+          );
+        })}
       </View>
     );
+    // Pinned: the pin alone, always; the others hover in to its left.
+    if (pinned && pin) {
+      return (
+        <>
+          {cluster(rest, revealed, 32)}
+          {cluster([pin], true, 4)}
+        </>
+      );
+    }
+    return cluster(list, revealed, 4);
   }
 
-  /**
-   * Opens a row's ⋮ menu over the list, below the row, or above it when the list ends too soon.
-   * Nothing under it moves.
-   */
-  function openMenu(key: string) {
-    const node = nodes.current.get(key);
-    const parent = container.current;
-    if (!node || !parent) return;
-    const tall = actionsFor(key).filter((action) => action.inMenu).length * MENU_ITEM + 10;
-    node.measureLayout(
-      parent,
-      (_x, y, _width, rowHeight) => {
-        const below = y + rowHeight + 2;
-        const top = below + tall > height && y - tall - 2 >= 0 ? y - tall - 2 : below;
-        setMenu({ key, top, bottom: top + tall });
-      },
-      () => {},
-    );
+  /** Shows a tick in place of the copy glyph for a moment, so the press is acknowledged. */
+  function flashCopied(key: string) {
+    setCopiedRow(key);
+    if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    copiedTimer.current = setTimeout(() => setCopiedRow(null), 900);
+  }
+
+  function toggleArchive(id: string) {
+    setArchiveOpen((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  const isClosed = (group: ArrangedGroup) =>
+    (group.links.length > 0 && group.links.every((link) => link.archived)) !==
+    flipped.has(group.id);
+
+  function toggleGroup(id: string) {
+    setCollapsed((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   }
 
   function startRename(key: string, current: string) {
     setRenaming(key);
     setName(current);
-  }
-
-  /** An inline name field; an empty name brings back the default. */
-  function renameField(placeholder: string, onSave: (name: string) => void) {
-    const submit = () => {
-      onSave(name);
-      setRenaming(null);
-    };
-    return (
-      <View style={styles.rename}>
-        <TextInput
-          autoFocus
-          selectTextOnFocus
-          value={name}
-          onChangeText={setName}
-          onSubmitEditing={submit}
-          placeholder={placeholder}
-          placeholderTextColor={muted}
-          style={styles.input}
-        />
-        {iconButton("Check", "Save the name", submit, strong)}
-        {iconButton("X", "Cancel renaming", () => setRenaming(null))}
-      </View>
-    );
   }
 
   if (query.isPending) return <Text style={styles.note}>Reading links…</Text>;
@@ -668,107 +958,299 @@ function AgentLinks({
   const lift = (moving: boolean) =>
     moving && drag ? [styles.lifted, { transform: [{ translateY: drag.dy }] }] : null;
   const drop = drag && drag.dy !== 0 ? dropFor(drag) : null;
+  // Rows fade by age against the others in this chat's list; archived ones are not counted.
+  const seen = view.flatMap((group) =>
+    group.links.flatMap((link) => (link.archived || link.seenAt === undefined ? [] : [link.seenAt])),
+  );
+  const newest = Math.max(...seen);
+  const oldest = Math.min(...seen);
 
   return (
     <View
       ref={container}
-      onLayout={({ nativeEvent }) => setHeight(nativeEvent.layout.height)}
-      // An open menu past the end of a short list grows the list rather than being cut off.
-      style={[styles.list, menu ? { minHeight: menu.bottom + 4 } : null]}
+      style={styles.list}
     >
-      {rearranging ? (
-        <View style={styles.rearrangeBar}>
-          <Text style={styles.rearrangeText}>Drag links and groups to rearrange</Text>
-          <HoverPressable
-            accessibilityRole="button"
-            accessibilityLabel="Done rearranging"
-            style={feedback(styles.done)}
-            onPress={() => setRearranging(false)}
-          >
-            <Text style={styles.doneText}>Done</Text>
-          </HoverPressable>
-        </View>
-      ) : null}
-      {view.length === 0 ? <Text style={styles.note}>No links in this chat yet.</Text> : null}
-      {view.flatMap((group, at) => {
-        const groupMoving = drag?.type === "group" && drag.id === group.id;
-        const key = `g:${group.id}`;
-        return [
-          <DragRow
-            key={key}
-            {...dragging("group", group.id, key)}
-            style={[styles.header, at > 0 && styles.gap, lift(groupMoving)]}
-          >
-            <Icon name={group.icon} size={14} color={muted} />
-            {renaming === key ? (
-              renameField(
-                "Group name",
-                (title) => void save((current) => renameGroup(current, group.id, title)),
-              )
-            ) : (
+      <View style={styles.rails}>
+          {view.length === 0 ? <Text style={styles.note}>No links in this chat yet.</Text> : null}
+        {view.flatMap((group, at) => {
+          const groupMoving = drag?.type === "group" && drag.id === group.id;
+          const key = `g:${group.id}`;
+          const items = [
+            <DragRow
+              key={key}
+              {...dragging("group", group.id, key)}
+              onPointerEnter={() => setHovered(key)}
+              onPointerLeave={() => setHovered((current) => (current === key ? null : current))}
+              style={[
+                styles.header,
+                hovered === key && styles.hover,
+                at > 0 && styles.gap,
+                lift(groupMoving),
+              ]}
+            >
               <>
-                <Text
-                  style={styles.title}
-                  accessibilityRole="header"
-                  {...movable("group", group.id)}
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`${isClosed(group) ? "Open" : "Close"} ${group.title}`}
+                  accessibilityState={{ expanded: !isClosed(group) }}
+                  disabled={rearranging || renaming === key}
+                  style={styles.headerPress}
+                  onPress={() => toggleGroup(group.id)}
                 >
-                  {group.title}
-                </Text>
-                <Text style={styles.count}>{group.links.length}</Text>
-                <View style={styles.spacer} />
-                {actions(key, group.title)}
-              </>
-            )}
-          </DragRow>,
-          ...group.links.map((link) => {
-            const row = `l:${link.url}`;
-            return (
-              // The whole row lights up on hover, the way Paseo does it: pointer events on a plain
-              // View, with its buttons inside.
-              <DragRow
-                key={row}
-                {...dragging("link", link.url, row)}
-                onPointerEnter={() => setHovered(row)}
-                onPointerLeave={() => setHovered((current) => (current === row ? null : current))}
-                style={[
-                  styles.row,
-                  hovered === row && styles.hover,
-                  lift(groupMoving || (drag?.type === "link" && drag.id === link.url)),
-                ]}
-              >
-                {renaming === row ? (
-                  renameField(
-                    "Link name",
-                    (named) => void save((current) => renameLink(current, link.url, named)),
-                  )
-                ) : (
-                  <>
-                    <Pressable
-                      accessibilityRole="link"
-                      accessibilityLabel={`Open ${link.url}`}
-                      {...movable("link", link.url)}
-                      disabled={rearranging}
-                      style={({ pressed }) => [styles.link, pressed && styles.press]}
-                      onPress={() => {
-                        void openExternalUrl(link.url);
-                        close();
-                      }}
+                <FadeTail
+                  active={overlayActions && !rearranging && revealedFor(key)}
+                  style={styles.headerTail}
+                >
+                  {/* Hovering swaps the group's icon for the chevron that opens or closes it. */}
+                  <View style={styles.lead}>
+                    {deleting && group.links.length > 0 ? (
+                      <Pressable
+                        accessibilityRole="checkbox"
+                        accessibilityLabel={`Select all links in ${group.title}`}
+                        accessibilityState={{
+                          checked: group.links.every((link) => selected.has(link.url)),
+                        }}
+                        hitSlop={8}
+                        onPress={() => pickGroup(group)}
+                      >
+                        <Checkbox
+                          checked={group.links.every((link) => selected.has(link.url))}
+                          color={strong}
+                          edge={muted}
+                        />
+                      </Pressable>
+                    ) : hovered === key && !rearranging && !deleting ? (
+                      <Icon
+                        name={isClosed(group) ? "ChevronRight" : "ChevronDown"}
+                        size={14}
+                        color={muted}
+                      />
+                    ) : (
+                      <Icon name={group.icon} size={14} color={muted} />
+                    )}
+                  </View>
+                  <View style={styles.editWrap}>
+                    <Text
+                      style={[styles.title, renaming === key && styles.invisible]}
+                      accessibilityRole="header"
+                      {...movable("group", group.id)}
                     >
-                      {link.name ? <Text style={styles.name}>{link.name}</Text> : null}
-                      <Text style={[styles.url, link.name ? styles.secondary : null]}>
-                        {breakable(link.url)}
-                      </Text>
-                    </Pressable>
-                    {actions(row, link.name ?? link.url)}
-                  </>
-                )}
-              </DragRow>
-            );
-          }),
-        ];
-      })}
-      {drop ? <View pointerEvents="none" style={[styles.drop, { top: drop.y - 1 }]} /> : null}
-      {adding ? (
+                      {group.title}
+                    </Text>
+                    {renaming === key ? (
+                      <InlineEdit
+                        value={name}
+                        onChange={setName}
+                        onCommit={(title) => {
+                          setRenaming(null);
+                          void save((current) => renameGroup(current, group.id, title));
+                        }}
+                        onCancel={() => setRenaming(null)}
+                        placeholder="Group name"
+                        color={strong}
+                        font={styles.title}
+                      />
+                    ) : null}
+                  </View>
+                  <Text style={styles.count}>{group.links.length}</Text>
+                </FadeTail>
+                {actions(key, group.title)}
+                </Pressable>
+              </>
+            </DragRow>,
+            ...group.links.map((link) => {
+              const row = `l:${link.url}`;
+              return (
+                // The whole row lights up on hover, the way Paseo does it: pointer events on a plain
+                // View, with its buttons inside.
+                <DragRow
+                  key={row}
+                  {...dragging("link", link.url, row)}
+                  onPointerEnter={() => setHovered(row)}
+                  onPointerLeave={() => setHovered((current) => (current === row ? null : current))}
+                  style={[
+                    styles.row,
+                    hovered === row && styles.hover,
+                    hovered === row || renaming === row || selected.has(link.url)
+                      ? null
+                      : { opacity: fadeOf(link.seenAt, newest, oldest) },
+                    lift(groupMoving || (drag?.type === "link" && drag.id === link.url)),
+                  ]}
+                >
+                      <FadeTail
+                        active={
+                          overlayActions &&
+                          !rearranging &&
+                          renaming !== row &&
+                          (revealedFor(row) || link.pinned)
+                        }
+                        fade={link.pinned && !revealedFor(row) ? PIN_FADE : ACTION_FADE}
+                        clear={link.pinned && !revealedFor(row) ? PIN_CLEAR : ACTION_CLEAR}
+                        style={styles.linkTail}
+                      >
+                        <Pressable
+                          accessibilityRole={deleting ? "checkbox" : "link"}
+                          accessibilityLabel={
+                            deleting ? `Pick ${targetOf(link)}` : `Open ${targetOf(link)}`
+                          }
+                          accessibilityState={
+                            deleting ? { checked: selected.has(link.url) } : undefined
+                          }
+                          // React Native Web leaves `checked` off the element, and this is a pick
+                          // box, so the state is spelled out for the web.
+                          {...(Platform.OS === "web"
+                            ? { "aria-checked": selected.has(link.url) }
+                            : null)}
+                          {...movable("link", link.url)}
+                          disabled={rearranging}
+                          style={({ pressed }) => [styles.link, pressed && styles.press]}
+                          onPress={() => {
+                            if (renaming === row) return;
+                            if (deleting) {
+                              pick(link);
+                              return;
+                            }
+                            close();
+                            onOpen(link);
+                          }}
+                        >
+                          <View style={styles.linkBody}>
+                            <View style={styles.lead}>
+                              {deleting ? (
+                                <Checkbox
+                                  checked={selected.has(link.url)}
+                                  color={strong}
+                                  edge={muted}
+                                />
+                              ) : rearranging ? (
+                                <Icon name="GripVertical" size={16} color={muted} />
+                              ) : (
+                                <View style={styles.bullet} />
+                              )}
+                            </View>
+                            <View style={styles.linkColumn}>
+                              {link.name ? (
+                                <View style={styles.editWrap}>
+                                  <Text
+                                    style={[styles.name, renaming === row && styles.invisible]}
+                                  >
+                                    {link.name}
+                                  </Text>
+                                  {renaming === row ? (
+                                    <InlineEdit
+                                      value={name}
+                                      onChange={setName}
+                                      onCommit={(named) => {
+                                        setRenaming(null);
+                                        void save((current) =>
+                                          renameLink(
+                                            current,
+                                            link.url,
+                                            named === targetOf(link) ? "" : named,
+                                          ),
+                                        );
+                                      }}
+                                      onCancel={() => setRenaming(null)}
+                                      placeholder="Link name"
+                                      color={strong}
+                                      font={styles.name}
+                                    />
+                                  ) : null}
+                                </View>
+                              ) : null}
+                              <View style={styles.editWrap}>
+                                <Text
+                                  style={[
+                                    styles.url,
+                                    link.name ? styles.secondary : null,
+                                    renaming === row && !link.name && styles.invisible,
+                                  ]}
+                                >
+                                  {breakable(targetOf(link))}
+                                </Text>
+                                {renaming === row && !link.name ? (
+                                  <InlineEdit
+                                    value={name}
+                                    onChange={setName}
+                                    onCommit={(named) => {
+                                      setRenaming(null);
+                                      void save((current) =>
+                                        renameLink(
+                                          current,
+                                          link.url,
+                                          named === targetOf(link) ? "" : named,
+                                        ),
+                                      );
+                                    }}
+                                    onCancel={() => setRenaming(null)}
+                                    placeholder="Link name"
+                                    color={strong}
+                                    font={styles.url}
+                                  />
+                                ) : null}
+                              </View>
+                              {link.title &&
+                              link.title !== link.name &&
+                              link.title !== labelOf(link.url) ? (
+                                <Text numberOfLines={1} style={styles.pageTitle}>
+                                  {link.title}
+                                </Text>
+                              ) : null}
+                            </View>
+                          </View>
+                        </Pressable>
+                      </FadeTail>
+                      {actions(row, link.name ?? targetOf(link))}
+                </DragRow>
+              );
+            }),
+          ];
+          // Archived links are last in the group, so the rows split where the archive starts.
+          const shown = group.links.filter((link) => !link.archived).length;
+          const archived = group.links.length - shown;
+          const archiveKey = `a:${group.id}`;
+          const archiveIsOpen = archiveOpen.has(group.id);
+          return [
+            items[0],
+            <GroupBody key={`${group.id}:body`} collapsed={isClosed(group)}>
+              {items.slice(1, 1 + shown)}
+              {archived > 0 ? (
+                <View
+                  key={archiveKey}
+                  onPointerEnter={() => setHovered(archiveKey)}
+                  onPointerLeave={() =>
+                    setHovered((current) => (current === archiveKey ? null : current))
+                  }
+                  style={[styles.row, hovered === archiveKey && styles.hover]}
+                >
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={`${archiveIsOpen ? "Close" : "Open"} archive`}
+                    accessibilityState={{ expanded: archiveIsOpen }}
+                    disabled={rearranging}
+                    style={styles.archivePress}
+                    onPress={() => toggleArchive(group.id)}
+                  >
+                    <View style={styles.lead}>
+                      <Icon
+                        name={archiveIsOpen ? "ChevronDown" : "ChevronRight"}
+                        size={14}
+                        color={muted}
+                      />
+                    </View>
+                    <Text style={styles.count}>{`Archive · ${archived}`}</Text>
+                  </Pressable>
+                </View>
+              ) : null}
+              {archived > 0 ? (
+                <GroupBody key={`${group.id}:archive`} collapsed={!archiveIsOpen}>
+                  {items.slice(1 + shown)}
+                </GroupBody>
+              ) : null}
+            </GroupBody>,
+          ];
+        })}
+        {adding ? (
         <View style={styles.form}>
           <View style={styles.icons}>
             {GROUP_ICONS.map((choice) => (
@@ -799,47 +1281,82 @@ function AgentLinks({
           </View>
         </View>
       ) : (
-        <HoverPressable
-          accessibilityRole="button"
-          style={feedback(styles.add)}
-          onPress={() => setAdding(true)}
-        >
-          <Icon name="Plus" size={14} color={muted} />
-          <Text style={styles.addText}>New group</Text>
-        </HoverPressable>
-      )}
-      {menu ? (
-        <>
-          <Pressable
-            accessibilityLabel="Close menu"
-            style={styles.backdrop}
-            onPress={() => setMenu(null)}
-          />
-          <View accessibilityRole="menu" style={[styles.menu, { top: menu.top }]}>
-            {actionsFor(menu.key)
-              .filter((action) => action.inMenu)
-              .map(({ icon, label, run, danger }) => {
-                const color = danger ? theme.colors.statusDanger : strong;
-                return (
-                  <HoverPressable
-                    key={label}
-                    accessibilityRole="menuitem"
-                    accessibilityLabel={label}
-                    disabled={busy}
-                    style={feedback(styles.item)}
-                    onPress={() => {
-                      setMenu(null);
-                      run();
-                    }}
-                  >
-                    <Icon name={icon} size={14} color={color} />
-                    <Text style={[styles.itemText, { color }]}>{label}</Text>
-                  </HoverPressable>
-                );
-              })}
+        <StickyFooter surface={theme.colors.surface0}>
+        <View style={styles.footer}>
+          <View style={styles.addRow}>
+            <HoverPressable
+              accessibilityRole="button"
+              style={feedback(styles.add)}
+              onPress={() => setAdding(true)}
+            >
+              <Icon name="Plus" size={14} color={muted} />
+              <Text style={styles.addText}>New group</Text>
+            </HoverPressable>
           </View>
-        </>
-      ) : null}
+          <View style={styles.spacer} />
+          {rearranging ? (
+            <HoverPressable
+              accessibilityRole="button"
+              accessibilityLabel="Done rearranging"
+              style={feedback(styles.done)}
+              onPress={() => setRearranging(false)}
+            >
+              <Text style={styles.doneText}>Done</Text>
+            </HoverPressable>
+          ) : deleting ? (
+            <>
+              <HoverPressable
+                accessibilityRole="button"
+                accessibilityLabel="Delete the selected links"
+                accessibilityState={{ disabled: selected.size === 0 }}
+                disabled={busy || selected.size === 0}
+                style={feedback([styles.action, styles.footerAction, selected.size ? null : styles.dim])}
+                onPress={deleteSelected}
+              >
+                <Icon name="Check" size={16} color={selected.size ? strong : muted} />
+              </HoverPressable>
+              <HoverPressable
+                accessibilityRole="button"
+                accessibilityLabel="Stop deleting"
+                style={feedback(styles.action)}
+                onPress={stopDeleting}
+              >
+                <Icon name="X" size={16} color={muted} />
+              </HoverPressable>
+            </>
+          ) : (
+            <>
+              <HoverPressable
+                accessibilityRole="button"
+                accessibilityLabel="Rearrange links"
+                style={feedback([styles.action, styles.footerAction])}
+                onPress={() => {
+                  setDeleting(false);
+                  setRearranging(true);
+                }}
+              >
+                <Icon name="ArrowUpDown" size={14} color={muted} />
+              </HoverPressable>
+              <HoverPressable
+                accessibilityRole="button"
+                accessibilityLabel="Delete links"
+                disabled={busy || !hasLinks}
+                style={feedback(styles.action, false)}
+                onPress={() => {
+                  setRenaming(null);
+                  setSelected(new Set());
+                  setDeleting(true);
+                }}
+              >
+                <Icon name="Trash2" size={14} color={hasLinks ? muted : muted} />
+              </HoverPressable>
+            </>
+          )}
+        </View>
+        </StickyFooter>
+        )}
+      </View>
+      {drop ? <View pointerEvents="none" style={[styles.drop, { top: drop.y - 1 }]} /> : null}
     </View>
   );
 }

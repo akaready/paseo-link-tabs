@@ -1,7 +1,7 @@
 {
   "name": "link-tabs",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.6.0",
   "description": "Keeps every link an agent shares in Paseo a tap away in a Links pill above the composer, grouped by where it points, with the ones you pin in the bar",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -23,6 +23,7 @@
   "devDependencies": {
     "@getpaseo/plugin": "0.11.2",
     "@tanstack/react-query": "^5.90.11",
+    "@types/node": "^22.20.5",
     "@types/react": "~19.2.0",
     "react": "19.1.0",
     "react-native": "0.81.5",

@@ -1,5 +1,4 @@
 import {
-  openExternalUrl,
   useAgent,
   type PluginButton,
   type PluginButtonContentProps,
@@ -9,9 +8,24 @@ import {
 } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/react-native";
 import { useEffect } from "react";
-import { bareOf, labelOf } from "../shared/groups";
-import { listLinks, type ArrangedGroup } from "../shared/links";
+import { bareOf, isFileUrl, labelOf, labelOfPath } from "../shared/groups";
+import {
+  listLinks,
+  openLink,
+  previewLink,
+  type ArrangedGroup,
+  type Link,
+  type Opener,
+} from "../shared/links";
+import { handOff } from "./handoff";
+import { modifierHeld, trackModifier } from "./web";
 import { LinkList } from "./list";
+import { openSharedLink } from "./open";
+import { LinkPreviewPanel, PREVIEW_PANEL } from "./panel";
+
+/** A link's pill label: the user's name for it, else the file's folder and name, else the URL. */
+const pillLabel = (link: ArrangedGroup["links"][number]) =>
+  link.name ?? (link.path ? labelOfPath(link.path) : labelOf(link.url));
 
 /** A pill after the Links pill: its ID, its button, and what it shows. */
 type Extra = [id: string, button: PluginButton, key: string];
@@ -26,6 +40,8 @@ interface Bar {
   extras: PluginButtonRegistration[];
   /** What `extras` shows, to skip a read that changes nothing. */
   drawn: string;
+  /** Where the user chose to open links: Paseo's browser, or the OS. */
+  opener: Opener;
   /** On a phone the composer track is too narrow for more, so everything stays in the Links pill. */
   linksOnly: boolean;
 }
@@ -62,9 +78,12 @@ export function followAgents(client: PluginClientContext) {
             items: group.links.map((link, index) => ({
               kind: "item" as const,
               id: `link-${index}`,
-              title: link.name ?? bareOf(link.url),
+              title: link.name ?? (link.path ?? bareOf(link.url)),
               icon: group.icon,
-              behavior: { kind: "action" as const, onPress: () => openExternalUrl(link.url) },
+              behavior: {
+                kind: "action" as const,
+                onPress: () => void open(agentId, bar.workspaceId, link),
+              },
             })),
           },
         },
@@ -77,10 +96,10 @@ export function followAgents(client: PluginClientContext) {
       .map(({ group, link }, index): Extra => [
         `link-${index}`,
         {
-          title: link.url,
+          title: link.path ?? link.url,
           icon: group.icon,
-          label: link.name ?? labelOf(link.url),
-          behavior: { kind: "action", onPress: () => openExternalUrl(link.url) },
+          label: pillLabel(link),
+          behavior: { kind: "action", onPress: () => void open(agentId, bar.workspaceId, link) },
         },
         JSON.stringify([group.icon, link.url, link.name]),
       ]);
@@ -96,9 +115,43 @@ export function followAgents(client: PluginClientContext) {
     bar.drawn = drawn;
   }
 
+  /**
+   * Opens a link in the bar. A panel is the only plugin surface that reaches Paseo's browser, so
+   * the link goes through the Link preview panel; a local file is served over http first, since
+   * that browser takes only http(s). Where the panel cannot open, the OS opens it as before.
+   */
+  async function open(agentId: string, workspaceId: string, link: Link) {
+    // ⌘ (Ctrl elsewhere) opens the other way: it is the one shortcut, so there is one setting.
+    const opener = bars.get(agentId)?.opener ?? "paseo";
+    const useSystem = modifierHeld() ? opener === "paseo" : opener === "system";
+    if (useSystem) return openWithSystem(link);
+    const file = isFileUrl(link.url) ? link.url : null;
+    let url = link.url;
+    if (file) {
+      const preview = await client.rpc(previewLink, { url: file }).catch(() => null);
+      if (!preview?.url) return openWithSystem(link);
+      url = preview.url;
+    }
+    try {
+      handOff(agentId, { url, file: file ?? undefined });
+      client.openPanel(PREVIEW_PANEL, { workspaceId, agentId });
+    } catch {
+      void openWithSystem(link);
+    }
+  }
+
+  /** Opens a link with the OS: the file itself for a local one, else the platform's browser. */
+  function openWithSystem(link: Link) {
+    return openSharedLink((input) => client.rpc(openLink, input), link.url);
+  }
+
   function refresh(agentId: string) {
     client.rpc(listLinks, { agentId }).then(
-      ({ groups }) => show(agentId, groups),
+      ({ groups, opener }) => {
+        const bar = bars.get(agentId);
+        if (bar) bar.opener = opener;
+        show(agentId, groups);
+      },
       (error) => {
         if (!lifetime.signal.aborted) console.error("[link-tabs] Reading links failed", error);
       },
@@ -111,7 +164,16 @@ export function followAgents(client: PluginClientContext) {
   }
 
   function List(props: PluginButtonContentProps) {
-    return <LinkList {...props} onLinks={show} onChange={refreshMounted} />;
+    if (props.context !== "agent") return null;
+    const { agentId, workspaceId } = props;
+    return (
+      <LinkList
+        {...props}
+        onLinks={show}
+        onChange={refreshMounted}
+        onOpen={(link) => void open(agentId, workspaceId, link)}
+      />
+    );
   }
 
   /** The Links pill's icon, mounted only while its chat's composer is on screen. */
@@ -135,7 +197,7 @@ export function followAgents(client: PluginClientContext) {
       if (agentId) refresh(agentId);
     }, [agentId, status, linksOnly]);
     // The hero of the bar: everything else there is something the user pinned.
-    return <Icon name="List" size={size} color={theme.colors.accent} />;
+    return <Icon name="Link" size={size} color={theme.colors.accent} />;
   }
 
   function remove(agentId: string) {
@@ -157,7 +219,14 @@ export function followAgents(client: PluginClientContext) {
         behavior: { kind: "popover", Content: List },
       },
     });
-    bars.set(agentId, { workspaceId, list, extras: [], drawn: "[]", linksOnly: false });
+    bars.set(agentId, {
+      workspaceId,
+      list,
+      extras: [],
+      drawn: "[]",
+      opener: "paseo",
+      linksOnly: false,
+    });
   }
 
   function observe(agent: { id: string; workspaceId?: string | null }) {
@@ -167,6 +236,16 @@ export function followAgents(client: PluginClientContext) {
     remove(agent.id);
     if (agent.workspaceId) add(agent.id, agent.workspaceId);
   }
+
+  const stopTrackingModifier = trackModifier();
+  const removePanel = client.addWorkspacePanel({
+    id: PREVIEW_PANEL,
+    title: "Link preview",
+    icon: "Link",
+    context: "agent",
+    locations: ["workspace"],
+    Component: LinkPreviewPanel,
+  });
 
   void client.paseo.agents
     .list({ subscribe: {}, signal: lifetime.signal })
@@ -192,6 +271,8 @@ export function followAgents(client: PluginClientContext) {
 
   return () => {
     lifetime.abort();
+    stopTrackingModifier();
+    removePanel();
     for (const agentId of [...bars.keys()]) remove(agentId);
   };
 }

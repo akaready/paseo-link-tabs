@@ -3,6 +3,7 @@ import type { ArrangedGroup, Group, Link, LinkValues } from "./links";
 /** Link Tabs' own groups, by where a link points, in their default order. */
 const BUILT_IN: readonly Group[] = [
   { id: "dev", title: "Local dev", icon: "Laptop", pinned: false },
+  { id: "files", title: "Local files", icon: "FileText", pinned: false },
   { id: "tailnet", title: "Tailscale dev", icon: "Network", pinned: false },
   { id: "preview", title: "Previews", icon: "Rocket", pinned: false },
   { id: "github", title: "GitHub", icon: "GitBranch", pinned: false },
@@ -44,6 +45,13 @@ const DOCS_HOST =
 
 const PARTS = /^https?:\/\/(?:[^@/?#]*@)?(\[[^\]]+\]|[^:/?#]+)(:\d+)?([^?#]*)(.*)$/;
 
+/** A link to a file on the machine the daemon runs on, rather than to a page on the web. */
+export const isFileUrl = (url: string) => /^file:\/\//i.test(url);
+
+/** The path a `file://` URL points at. */
+export const filePathOf = (url: string) =>
+  decodeURIComponent(url.replace(/^file:\/\//i, "")) || "/";
+
 /** A URL's host (lowercase, without `www.`), port (with its colon), path, and query and hash. */
 function partsOf(url: string) {
   const [, host = "", port = "", path = "", rest = ""] = PARTS.exec(url) ?? [];
@@ -52,6 +60,7 @@ function partsOf(url: string) {
 
 /** The built-in group a link falls in by where it points. */
 export function kindOf(url: string) {
+  if (isFileUrl(url)) return "files";
   const { host, path } = partsOf(url);
   if (TAILNET_HOST.test(host)) return "tailnet";
   if (DEV_HOST.test(host)) return "dev";
@@ -105,12 +114,22 @@ function fit(label: string) {
 }
 
 /**
+ * A local file as its pill shows it: the folder and file name, as in `demo/index.html`. Where a
+ * file's folder matters, that tells two pages of the same name apart.
+ */
+export function labelOfPath(path: string) {
+  const segments = path.split("/").filter(Boolean);
+  return fit(segments.slice(-2).join("/") || path);
+}
+
+/**
  * A link as its pill shows it: `repo#12` for a GitHub pull request or issue, `owner/repo` for a
  * repository, the machine name for a tailnet host, else the host, port, path, and query. The
  * pill's icon says what kind of link it is, so one too wide shows its ending; a bare host keeps
  * its front, which tells hosts apart. The pill's tooltip and the list show the whole link.
  */
 export function labelOf(url: string) {
+  if (isFileUrl(url)) return labelOfPath(filePathOf(url));
   const { host, port, path, rest } = partsOf(url);
   const trimmed = rest ? path : path.replace(/\/$/, "");
   if (host === "github.com") {
@@ -155,6 +174,23 @@ export function groupOf(url: string, values: LinkValues, ids: ReadonlySet<string
   return placed && ids.has(placed) ? placed : kindOf(url);
 }
 
+const DAY = 86_400_000;
+/** Links not mentioned for this long go under the group's Archive row. */
+const ARCHIVE_AFTER = 7 * DAY;
+/** The opacity of the oldest link in a list. */
+const FADE_FLOOR = 0.45;
+
+/**
+ * How visible a row is: 1 for the newest link, down to `FADE_FLOOR` for the oldest, by when it
+ * was seen between the two. The span counts as at least a day, so links minutes apart barely
+ * differ. A link with no known time stays at full opacity.
+ */
+export function fadeOf(seenAt: number | undefined, newest: number, oldest: number) {
+  if (seenAt === undefined) return 1;
+  const age = Math.min(1, (newest - seenAt) / Math.max(newest - oldest, DAY));
+  return 1 - (1 - FADE_FLOOR) * Math.max(0, age);
+}
+
 /**
  * Links in their groups, groups in the user's order, and links in the order they were dragged
  * into, then newest first. Built-in groups without links are left out; the user's are kept so
@@ -166,6 +202,9 @@ export function arrange(links: readonly Link[], values: LinkValues): ArrangedGro
   const members = new Map(groups.map((group) => [group.id, [] as Link[]]));
   for (const link of links) members.get(groupOf(link.url, values, ids))!.push(link);
   const pinned = new Set(values.pinnedLinks);
+  const now = Date.now();
+  const archived = (link: Link) =>
+    link.seenAt !== undefined && now - link.seenAt > ARCHIVE_AFTER && !pinned.has(link.url);
   return groups
     .map((group) => {
       const order = values.order[group.id] ?? [];
@@ -173,8 +212,10 @@ export function arrange(links: readonly Link[], values: LinkValues): ArrangedGro
         const index = order.indexOf(url);
         return index < 0 ? Infinity : index;
       };
+      // Archived links come last, so the ones on show keep their places in the array.
       const sorted = [...members.get(group.id)!].sort(
-        (a, b) => rank(a.url) - rank(b.url) || b.seq - a.seq,
+        (a, b) =>
+          Number(archived(a)) - Number(archived(b)) || rank(a.url) - rank(b.url) || b.seq - a.seq,
       );
       return {
         ...group,
@@ -183,6 +224,7 @@ export function arrange(links: readonly Link[], values: LinkValues): ArrangedGro
           ...link,
           pinned: pinned.has(link.url),
           name: values.names[link.url],
+          archived: archived(link),
         })),
       };
     })
