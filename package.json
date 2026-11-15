@@ -1,7 +1,7 @@
 {
   "name": "link-tabs",
   "private": true,
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Keeps every link an agent shares in Paseo a tap away in a Links pill above the composer, grouped by where it points, with the ones you pin in the bar",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {

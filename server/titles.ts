@@ -1,4 +1,6 @@
+import { lookup } from "node:dns/promises";
 import { readFile } from "node:fs/promises";
+import { isIP } from "node:net";
 import { fileURLToPath } from "node:url";
 import { isFileUrl } from "../shared/groups";
 
@@ -33,6 +35,18 @@ function titleIn(html: string) {
   return title ? title.slice(0, MAX_LENGTH) : null;
 }
 
+// Addresses that are never a page worth titling: the unspecified address, and link-local ones,
+// where cloud metadata services and the like answer. Loopback and private networks stay allowed,
+// since a dev server there is exactly what the list links to.
+const BLOCKED = /^(0\.0\.0\.0|::|169\.254\.|fe[89ab][0-9a-f]:|::ffff:(0\.0\.0\.0|169\.254\.))/i;
+
+/** Whether the URL's host resolves only to addresses worth fetching. */
+async function allowed(url: string) {
+  const host = new URL(url).hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  const addresses = isIP(host) ? [host] : (await lookup(host, { all: true })).map((a) => a.address);
+  return addresses.length > 0 && !addresses.some((address) => BLOCKED.test(address));
+}
+
 async function fetchHtml(url: string) {
   if (isFileUrl(url)) {
     const bytes = await readFile(fileURLToPath(url));
@@ -49,7 +63,9 @@ async function fetchHtml(url: string) {
 }
 
 async function readPage(url: string, signal: AbortSignal) {
-  const res = await fetch(url, { signal, credentials: "omit" });
+  if (!(await allowed(url))) return "";
+  // A redirect is not followed: it could lead anywhere, and the page's title is the one it names.
+  const res = await fetch(url, { signal, credentials: "omit", redirect: "manual" });
   if (!res.ok || !res.body || !/text\/html/i.test(res.headers.get("content-type") ?? "")) {
     await res.body?.cancel();
     return "";
