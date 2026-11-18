@@ -11,8 +11,8 @@ const MAX_LENGTH = 120;
 const CONCURRENCY = 4;
 
 const cache = new Map<string, { title: string | null; expires: number }>();
-const inflight = new Set<string>();
-const queue: string[] = [];
+const inflight = new Map<string, Promise<void>>();
+const queue: { url: string; resolve(): void }[] = [];
 let running = 0;
 
 const ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
@@ -93,36 +93,47 @@ async function load(url: string) {
 
 function pump() {
   while (running < CONCURRENCY && queue.length) {
-    const url = queue.shift()!;
+    const { url, resolve } = queue.shift()!;
     running += 1;
     void load(url).finally(() => {
       running -= 1;
       inflight.delete(url);
+      resolve();
       pump();
     });
   }
 }
 
 /**
- * The titles known so far, at once. Pages not yet known are fetched in the background, and
- * `pending` tells the caller to ask again shortly.
+ * The titles known now, after giving pages not yet known a moment to answer. A page that is
+ * slower is left to finish in the background and is there on the next call, so a title never
+ * turns up in a list that was already sent.
  */
-export function titlesOf(urls: readonly string[]) {
-  const titles = new Map<string, string>();
-  let pending = false;
+export async function titlesOf(urls: readonly string[], patience = 1200) {
+  const loads: Promise<unknown>[] = [];
   for (const url of urls) {
     const hit = cache.get(url);
-    if (hit && hit.expires > Date.now()) {
-      if (hit.title) titles.set(url, hit.title);
-      continue;
+    if (hit && hit.expires > Date.now()) continue;
+    let load = inflight.get(url);
+    if (!load) {
+      load = new Promise<void>((resolve) => queue.push({ url, resolve }));
+      inflight.set(url, load);
     }
-    if (hit?.title) titles.set(url, hit.title);
-    pending = true;
-    if (!inflight.has(url)) {
-      inflight.add(url);
-      queue.push(url);
-    }
+    loads.push(load);
   }
   pump();
-  return { titles, pending };
+  if (loads.length) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.all(loads),
+      new Promise((resolve) => (timer = setTimeout(resolve, patience))),
+    ]);
+    clearTimeout(timer);
+  }
+  const titles = new Map<string, string>();
+  for (const url of urls) {
+    const title = cache.get(url)?.title;
+    if (title) titles.set(url, title);
+  }
+  return titles;
 }

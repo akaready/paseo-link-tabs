@@ -142,7 +142,11 @@ function GroupBody({ collapsed, children }: { collapsed: boolean; children: Reac
     <Animated.View
       style={{
         overflow: "hidden",
-        height: height ? progress.interpolate({ inputRange: [0, 1], outputRange: [0, height] }) : undefined,
+        height: height
+          ? progress.interpolate({ inputRange: [0, 1], outputRange: [0, height] })
+          : collapsed
+            ? 0
+            : undefined,
       }}
       pointerEvents={collapsed ? "none" : "auto"}
     >
@@ -222,6 +226,11 @@ function FadeTail({
  * rows melt away behind its buttons. Only the web can stick; elsewhere it follows the list.
  */
 function StickyFooter({ surface, children }: { surface: string; children: ReactNode }) {
+  if (Platform.OS !== "web") return <>{children}</>;
+  return <WebStickyFooter surface={surface}>{children}</WebStickyFooter>;
+}
+
+function WebStickyFooter({ surface, children }: { surface: string; children: ReactNode }) {
   const blur = useRef<View>(null);
   // The surface colour is a dependency so a theme change paints the fade again.
   useEffect(() => fadeToBackground(blur.current), [surface]);
@@ -301,9 +310,12 @@ function AgentLinks({
 }: Props & { agentId: string }) {
   const list = useRpc(listLinks);
   // Read again every time the list opens, which also catches links written mid-turn.
-  const query = useQuery({ queryKey: ["links", agentId], queryFn: () => list({ agentId }),
-    // Titles are fetched in the background; ask again until they are all in.
-    refetchInterval: (current) => (current.state.data?.titlesPending ? 2500 : false),
+  // Not on focus or reconnect: a list that was drawn stays as it is until it is opened again.
+  const query = useQuery({
+    queryKey: ["links", agentId],
+    queryFn: () => list({ agentId }),
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
   });
   const settings = useSettings(linkSettings);
   const toast = useToast();

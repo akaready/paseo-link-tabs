@@ -12,10 +12,10 @@ export default function contribute(server: PluginServerContext) {
     const stored = await settings.read();
     const values = linkSettings.schema.parse(stored.status === "ready" ? stored.values : {});
     const links = await linksOf(paseo, agentId, values.cleared[agentId] ?? {});
-    // Titles never hold the list up: what is known goes out now, the rest is fetched meanwhile.
-    const { titles, pending } = titlesOf(links.map((link) => link.url));
+    // Slow pages get a moment, then the list goes out without them and they are ready next time.
+    const titles = await titlesOf(links.map((link) => link.url));
     const titled = links.map((link) => ({ ...link, title: titles.get(link.url) }));
-    return { groups: arrange(titled, values), opener: values.opener, titlesPending: pending };
+    return { groups: arrange(titled, values), opener: values.opener };
   });
   server.handle(openLink, async ({ url }) => ({ opened: await openLocalFile(url) }));
   server.handle(previewLink, async ({ url }) => ({ url: await previewUrlOf(url) }));

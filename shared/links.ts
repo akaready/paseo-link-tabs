@@ -58,8 +58,6 @@ export const listLinks = defineRpc({
   output: z.object({
     groups: z.array(arrangedGroup),
     opener,
-    /** Some titles are still being fetched, so asking again soon will return more. */
-    titlesPending: z.boolean().optional(),
   }),
 });
 
